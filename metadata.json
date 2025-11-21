@@ -1,0 +1,7 @@
+{
+  "name": "Stark Protocol: Repulsor Test v2.0",
+  "description": "A high-fidelity 3D combat simulator featuring gesture control and leaderboard integration.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
