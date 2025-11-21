@@ -27,7 +27,7 @@ interface GameState {
   score: number;
   wave: number;
   enemies: Enemy[];
-  beamCharges: number; // 0 to 5
+  beamCharges: number; // 0 to 5 (Ammo count)
 }
 
 interface Enemy {
@@ -58,6 +58,13 @@ interface ElectricalArc {
     life: number;
 }
 
+interface Shockwave {
+    mesh: THREE.Mesh;
+    light: THREE.PointLight;
+    life: number;
+    direction: THREE.Vector3 | null; // null indicates omni-directional 360 blast
+}
+
 interface DamageText {
   sprite: THREE.Sprite;
   velocity: THREE.Vector3;
@@ -79,6 +86,7 @@ const REPULSOR_COOLDOWN_MS = 200;
 const BEAM_DURATION_MS = 1000;
 const WAVE_DURATION_SEC = 45;
 const MAX_BEAM_CHARGES = 5;
+const BEAM_REGEN_MS = 1000; // 1 Second per charge (5 charges in 5 seconds)
 const BEAM_AOE_RADIUS = 3.5; // Wide destruction radius
 
 // --- Helper Functions ---
@@ -119,15 +127,13 @@ const HUD = ({
   handInput: HandInput;
 }) => {
   const hpPercent = Math.max(0, gameState.health);
-  const beamReady = gameState.beamCharges >= MAX_BEAM_CHARGES;
+  const beamAmmo = gameState.beamCharges;
+  const beamReady = beamAmmo > 0;
   
   let hpColor = "bg-cyan-400";
   if (hpPercent < 50) hpColor = "bg-yellow-400";
   if (hpPercent < 20) hpColor = "bg-red-500 animate-pulse";
 
-  // Calculate Reticle Position
-  // If hand detected, use handInput. If mouse (not playing or no hand), center it or use stored mouse pos (not stored in state here for perf, handled in canvas)
-  // For HUD, we rely on handInput state which is updated by both mouse (simulated) and hand
   const reticleX = handInput.x * 100;
   const reticleY = handInput.y * 100;
 
@@ -166,9 +172,9 @@ const HUD = ({
             </div>
           </div>
 
-          {/* Dynamic Reticle (Replaces Center Crosshair) */}
+          {/* Dynamic Reticle */}
           <div 
-            className="fixed pointer-events-none z-20 transition-transform duration-75 ease-out will-change-transform"
+            className="fixed pointer-events-none z-20 will-change-transform"
             style={{ 
                 left: `${reticleX}%`, 
                 top: `${reticleY}%`,
@@ -179,11 +185,11 @@ const HUD = ({
              <div 
                 className={`rounded-full border border-cyan-400/60 flex items-center justify-center transition-all duration-100
                     ${isFiring ? 'w-16 h-16 scale-110 opacity-100' : 'w-8 h-8 opacity-60'}
-                    ${handInput.gesture === 'Open_Palm' && beamReady ? 'border-yellow-400 shadow-[0_0_15px_yellow]' : 'shadow-[0_0_10px_cyan]'}
+                    ${handInput.gesture === 'Open_Palm' && beamReady ? 'border-blue-400 shadow-[0_0_20px_#3b82f6]' : 'shadow-[0_0_10px_cyan]'}
                 `}
               >
                 {/* Center Dot */}
-                <div className={`w-1 h-1 rounded-full ${beamReady && handInput.gesture === 'Open_Palm' ? 'bg-yellow-400' : 'bg-cyan-300'}`}></div>
+                <div className={`w-1 h-1 rounded-full ${beamReady && handInput.gesture === 'Open_Palm' ? 'bg-blue-400' : 'bg-cyan-300'}`}></div>
               </div>
               
               {/* Hit Marker */}
@@ -212,16 +218,16 @@ const HUD = ({
                     <div 
                         key={i}
                         className={`w-12 h-3 skew-x-[-12deg] border border-slate-800 transition-all duration-300
-                            ${i < gameState.beamCharges 
-                                ? (beamReady ? 'bg-cyan-400 shadow-[0_0_15px_#22d3ee]' : 'bg-yellow-600 shadow-[0_0_5px_orange]') 
-                                : 'bg-slate-900'
+                            ${i < beamAmmo 
+                                ? 'bg-blue-500 shadow-[0_0_10px_#3b82f6]' // Filled
+                                : 'bg-slate-900/50' // Empty
                             }
                         `}
                     />
                  ))}
                </div>
-               <div className={`mt-2 text-xs font-bold tracking-widest ${beamReady ? 'text-cyan-300 animate-pulse drop-shadow-[0_0_8px_rgba(34,211,238,0.8)]' : 'text-slate-500'}`}>
-                 {beamReady ? '[ SYSTEM READY // GESTURE: PALM ]' : `CHARGING... ${gameState.beamCharges}/${MAX_BEAM_CHARGES}`}
+               <div className={`mt-2 text-xs font-bold tracking-widest ${beamReady ? 'text-blue-300 animate-pulse drop-shadow-[0_0_8px_rgba(59,130,246,0.8)]' : 'text-slate-500'}`}>
+                 {beamReady ? '[ UNIBEAM READY // GESTURE: PALM ]' : `RECHARGING... ${beamAmmo}/${MAX_BEAM_CHARGES}`}
                </div>
             </div>
           </div>
@@ -284,6 +290,7 @@ const App: React.FC = () => {
   const enemiesRef = useRef<Enemy[]>([]);
   const activeLinesRef = useRef<{ mesh: THREE.Mesh; timestamp: number }[]>([]);
   const electricalArcsRef = useRef<ElectricalArc[]>([]);
+  const shockwavesRef = useRef<Shockwave[]>([]); 
   const particlesRef = useRef<Particle[]>([]);
   const damageTextsRef = useRef<DamageText[]>([]);
   const shakeIntensityRef = useRef<number>(0);
@@ -291,14 +298,33 @@ const App: React.FC = () => {
   const gridHelperRef = useRef<THREE.GridHelper | null>(null);
   const starsRef = useRef<THREE.Points | null>(null);
   
+  // Cached Assets (Performance Optimization)
+  const sharedMaterialsRef = useRef<{
+    particle: THREE.MeshBasicMaterial;
+    enemy: THREE.MeshStandardMaterial;
+    enemyRing: THREE.MeshBasicMaterial;
+    shockwave: THREE.MeshBasicMaterial;
+  } | null>(null);
+  const sharedGeometriesRef = useRef<{
+    particle: THREE.TetrahedronGeometry;
+    enemy: THREE.SphereGeometry;
+    enemyRing: THREE.TorusGeometry;
+    hitbox: THREE.SphereGeometry;
+    omniSphere: THREE.SphereGeometry;
+  } | null>(null);
+  
   const lastShotTimeRef = useRef<number>(0);
   const waveStartTimeRef = useRef<number>(0);
   const gestureRecognizerRef = useRef<any>(null);
   const lastGestureTimeRef = useRef<number>(0);
   
+  const beamRegenTimerRef = useRef<number>(0);
+
   // Input & Aiming Refs
-  // cursorPositionRef tracks 0-1 coords (x, y)
+  // cursorPositionRef tracks the SMOOTHED 0-1 coords used for rendering
   const cursorPositionRef = useRef({ x: 0.5, y: 0.5 });
+  // targetCursorPositionRef tracks the RAW 0-1 coords from input
+  const targetCursorPositionRef = useRef({ x: 0.5, y: 0.5 });
 
   // Firebase Refs
   const dbRef = useRef<any>(null);
@@ -312,7 +338,7 @@ const App: React.FC = () => {
     score: 0,
     wave: 1,
     enemies: [],
-    beamCharges: 0
+    beamCharges: 5 
   });
   const [timer, setTimer] = useState(45);
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
@@ -349,27 +375,25 @@ const App: React.FC = () => {
         osc.start(t);
         osc.stop(t + 0.1);
     } else if (type === 'beam') {
-        // Huge sound
         osc.type = 'sawtooth';
         osc.frequency.setValueAtTime(100, t);
-        osc.frequency.linearRampToValueAtTime(400, t + 0.2); // Charge up
-        osc.frequency.linearRampToValueAtTime(50, t + 1.0); // Release
+        osc.frequency.linearRampToValueAtTime(600, t + 0.2);
+        osc.frequency.linearRampToValueAtTime(50, t + 1.0);
         
         gain.gain.setValueAtTime(0.0, t);
         gain.gain.linearRampToValueAtTime(0.5, t + 0.1);
         gain.gain.exponentialRampToValueAtTime(0.001, t + 1.0);
         
-        // Static/Thunder noise
         const bufferSize = ctx.sampleRate * 1.0;
         const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
         const data = buffer.getChannelData(0);
         for (let i = 0; i < bufferSize; i++) {
-            data[i] = (Math.random() * 2 - 1) * 0.5;
+            data[i] = (Math.random() * 2 - 1) * 0.6;
         }
         const noise = ctx.createBufferSource();
         noise.buffer = buffer;
         const noiseGain = ctx.createGain();
-        noiseGain.gain.setValueAtTime(0.2, t);
+        noiseGain.gain.setValueAtTime(0.3, t);
         noiseGain.gain.linearRampToValueAtTime(0, t + 1.0);
         noise.connect(noiseGain);
         noiseGain.connect(ctx.destination);
@@ -380,7 +404,7 @@ const App: React.FC = () => {
     } else if (type === 'low_hp') {
         osc.type = 'sine';
         osc.frequency.setValueAtTime(800, t);
-        osc.frequency.setValueAtTime(0, t + 0.1); // Pulse
+        osc.frequency.setValueAtTime(0, t + 0.1);
         gain.gain.setValueAtTime(0.05, t);
         gain.gain.linearRampToValueAtTime(0, t + 0.2);
         osc.start(t);
@@ -471,13 +495,44 @@ const App: React.FC = () => {
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // Reduced pixel ratio for performance
     mountRef.current.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    // Environment: Infinite Starfield
+    // Initialize Cached Materials & Geometries
+    sharedMaterialsRef.current = {
+      particle: new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 1.0 }),
+      enemy: new THREE.MeshStandardMaterial({ 
+        color: 0x222222, 
+        emissive: 0xff0000, 
+        emissiveIntensity: 0.8,
+        roughness: 0.2,
+        metalness: 0.8
+      }),
+      enemyRing: new THREE.MeshBasicMaterial({ color: 0xff3300 }),
+      shockwave: new THREE.MeshBasicMaterial({ 
+          color: 0x88ffff, 
+          transparent: true, 
+          opacity: 0.9,
+          blending: THREE.AdditiveBlending,
+          side: THREE.DoubleSide
+      })
+    };
+    
+    // BIGGER ENEMIES UPDATE: Increased dimensions
+    sharedGeometriesRef.current = {
+        particle: new THREE.TetrahedronGeometry(0.15),
+        enemy: new THREE.SphereGeometry(1.2, 16, 16), // Radius increased from 0.3 to 1.2
+        enemyRing: new THREE.TorusGeometry(1.4, 0.05, 8, 16), // Scaled up ring
+        hitbox: new THREE.SphereGeometry(2.0, 8, 8), // Larger hitbox
+        omniSphere: new THREE.SphereGeometry(1, 32, 32) // For 360 shockwave
+    };
+    // Orient ring correctly
+    sharedGeometriesRef.current.enemyRing.rotateX(Math.PI / 2);
+
+    // Environment
     const starGeo = new THREE.BufferGeometry();
-    const starCount = 1000; // Reduced for performance
+    const starCount = 1000;
     const starPos = new Float32Array(starCount * 3);
     for(let i=0; i<starCount*3; i++) {
         starPos[i] = (Math.random() - 0.5) * 200;
@@ -488,27 +543,21 @@ const App: React.FC = () => {
     scene.add(stars);
     starsRef.current = stars;
 
-    // Lighting
     const ambientLight = new THREE.AmbientLight(0x222222);
     scene.add(ambientLight);
     const hemiLight = new THREE.HemisphereLight(0x00ffff, 0xff0000, 0.2);
     scene.add(hemiLight);
 
-    // Infinite Glowing Floor Grid
     const gridHelper = new THREE.GridHelper(200, 100, 0x00ffff, 0x001133);
     (gridHelper.material as THREE.Material).transparent = true;
     (gridHelper.material as THREE.Material).opacity = 0.2;
     scene.add(gridHelper);
     gridHelperRef.current = gridHelper;
 
-    // Muzzle Flash Light
     const muzzleLight = new THREE.PointLight(0x00ffff, 0, 10);
     camera.add(muzzleLight);
     muzzleLight.position.set(0.3, -0.3, -1);
     muzzleLightRef.current = muzzleLight;
-
-    // Particle Geometry Cache
-    const explosionGeo = new THREE.TetrahedronGeometry(0.15);
 
     scene.add(camera);
 
@@ -517,17 +566,16 @@ const App: React.FC = () => {
       switch(e.code) {
         case 'Space': 
           setHandInput(prev => ({ ...prev, gesture: 'Open_Palm' }));
-          setTimeout(() => triggerUnibeam(), 0); // Force unibeam logic
+          setTimeout(() => triggerUnibeam(), 0);
           break;
       }
     };
 
     const handleMouseMove = (e: MouseEvent) => {
-        // Update cursor state independent of pointer lock
         const x = e.clientX / window.innerWidth;
         const y = e.clientY / window.innerHeight;
-        cursorPositionRef.current = { x, y };
-        setHandInput(prev => ({ ...prev, x, y, detected: false })); // Fallback to mouse
+        targetCursorPositionRef.current = { x, y };
+        setHandInput(prev => ({ ...prev, x, y, detected: false }));
     };
 
     const handleMouseDown = () => {
@@ -551,7 +599,7 @@ const App: React.FC = () => {
         const sprite = new THREE.Sprite(material);
         
         sprite.position.copy(pos);
-        sprite.position.y += 0.5;
+        sprite.position.y += 1.0; // Higher offset for bigger enemies
         sprite.scale.set(1.5, 1.5, 1.5);
         
         scene.add(sprite);
@@ -561,10 +609,13 @@ const App: React.FC = () => {
     const spawnExplosion = (pos: THREE.Vector3) => {
       const count = 8; 
       for (let i = 0; i < count; i++) {
-        const mat = new THREE.MeshBasicMaterial({ color: 0xffaa00, transparent: true, opacity: 1.0 });
-        const mesh = new THREE.Mesh(explosionGeo, mat);
+        // Reusing Material and Geometry
+        const mesh = new THREE.Mesh(
+            sharedGeometriesRef.current!.particle, 
+            sharedMaterialsRef.current!.particle.clone() // Clone material to handle independent fade opacity
+        );
         mesh.position.copy(pos);
-        mesh.position.x += (Math.random() - 0.5) * 0.5;
+        mesh.position.x += (Math.random() - 0.5) * 1.0; // Bigger explosion spread
         
         const velocity = new THREE.Vector3(
           (Math.random() - 0.5) * 2,
@@ -580,14 +631,39 @@ const App: React.FC = () => {
       setTimeout(() => scene.remove(light), 100);
     };
 
+    const spawnShockwave = (origin: THREE.Vector3, direction: THREE.Vector3 | null) => {
+         // If direction is null, it is an OMNI (360) shockwave (Sphere)
+         // Otherwise it is a directional ring
+         let geometry = sharedGeometriesRef.current!.enemyRing;
+         if (!direction) geometry = sharedGeometriesRef.current!.omniSphere;
+
+         const mesh = new THREE.Mesh(
+             geometry,
+             sharedMaterialsRef.current!.shockwave.clone()
+         );
+         
+         mesh.position.copy(origin);
+         if (direction) {
+            mesh.scale.set(2,2,2); 
+            mesh.lookAt(origin.clone().add(direction));
+         } else {
+            // Omni shockwave starts small
+            mesh.scale.set(0.1, 0.1, 0.1);
+         }
+         
+         const light = new THREE.PointLight(0x0088ff, 4, 15);
+         mesh.add(light);
+
+         scene.add(mesh);
+         shockwavesRef.current.push({ mesh, light, life: 0, direction });
+    };
+
     const generateLightning = (start: THREE.Vector3, end: THREE.Vector3) => {
-        const dist = start.distanceTo(end);
         const points = [];
         points.push(start);
         const segments = 10;
         for (let i = 1; i < segments; i++) {
             const lerpPos = start.clone().lerp(end, i / segments);
-            // Jitter
             lerpPos.x += (Math.random() - 0.5) * 2.0;
             lerpPos.y += (Math.random() - 0.5) * 2.0;
             lerpPos.z += (Math.random() - 0.5) * 2.0;
@@ -595,25 +671,19 @@ const App: React.FC = () => {
         }
         points.push(end);
         const geo = new THREE.BufferGeometry().setFromPoints(points);
-        const mat = new THREE.LineBasicMaterial({ color: 0x00ffff });
+        const mat = new THREE.LineBasicMaterial({ color: 0x00aaff });
         const line = new THREE.Line(geo, mat);
         scene.add(line);
         electricalArcsRef.current.push({ mesh: line, life: 0.2 });
     };
 
     const triggerUnibeam = () => {
-      // Check charge logic via State in a way that works inside closure (using Ref for immediacy or just accessing state if updated)
-      // Since this function is called from event loops, we need access to current charge. 
-      // For simplicity, we will pass a check in the render loop or logic loop, but here we cheat by using the setter which has prev state access
-      
       setGameState(prev => {
-          if (prev.beamCharges < MAX_BEAM_CHARGES) return prev; // Not ready
+          if (prev.beamCharges <= 0) return prev; 
 
-          // Execute Beam
           playSound('beam');
-          addShake(1.5);
+          addShake(2.0); // Massive Shake
 
-          // Calculate Ray from Camera to Cursor
           const raycaster = new THREE.Raycaster();
           const mouseVec = new THREE.Vector2(
             (cursorPositionRef.current.x * 2) - 1,
@@ -622,18 +692,16 @@ const App: React.FC = () => {
           raycaster.setFromCamera(mouseVec, camera);
           const rayDir = raycaster.ray.direction.normalize();
           const rayOrigin = raycaster.ray.origin;
-          const endPoint = rayOrigin.clone().add(rayDir.multiplyScalar(100)); // Beam goes far
+          const endPoint = rayOrigin.clone().add(rayDir.multiplyScalar(100));
 
-          // 1. Visuals
-          // Main Beam
           const distance = 100;
-          const startPoint = new THREE.Vector3(0.3, -0.3, -0.5).applyMatrix4(camera.matrixWorld); // Hand position
+          const startPoint = new THREE.Vector3(0.3, -0.3, -0.5).applyMatrix4(camera.matrixWorld);
           
-          const cylGeo = new THREE.CylinderGeometry(0.5, 0.5, distance, 16, 1, true);
+          const cylGeo = new THREE.CylinderGeometry(0.8, 0.8, distance, 16, 1, true);
           cylGeo.rotateX(-Math.PI / 2);
           cylGeo.translate(0, 0, distance/2);
           const mat = new THREE.MeshBasicMaterial({ 
-              color: 0xccffff, 
+              color: 0x2288ff, 
               transparent: true, 
               opacity: 0.8,
               blending: THREE.AdditiveBlending,
@@ -644,34 +712,28 @@ const App: React.FC = () => {
           beamMesh.lookAt(endPoint);
           scene.add(beamMesh);
           
-          // Add electrical arcs
-          for(let k=0; k<5; k++) generateLightning(startPoint, endPoint);
+          for(let k=0; k<8; k++) generateLightning(startPoint, endPoint);
 
-          activeLinesRef.current.push({ mesh: beamMesh, timestamp: Date.now() + 500 }); // Longer duration
-
-          // 2. AOE Logic
-          // Define a cylinder collision segment
-          const enemiesToRemove: number[] = [];
+          // 360 DEGREE SHOCKWAVE
+          spawnShockwave(startPoint, null);
           
+          activeLinesRef.current.push({ mesh: beamMesh, timestamp: Date.now() + 500 }); 
+
+          // OMNI-DIRECTIONAL DAMAGE LOGIC
+          const enemiesToRemove: number[] = [];
           enemiesRef.current.forEach((enemy, idx) => {
-              // Project enemy position onto the beam ray
-              const ePos = enemy.mesh.position.clone();
-              const v = ePos.sub(rayOrigin);
-              const t = v.dot(rayDir);
-              const closestPoint = rayOrigin.clone().add(rayDir.clone().multiplyScalar(t));
+              // Instead of calculating distance to a beam ray, calculate distance to player camera
+              // This ensures the 360 visual shockwave matches the hitbox.
+              const dist = enemy.mesh.position.distanceTo(camera.position);
               
-              // Distance from beam center
-              const distToBeam = enemy.mesh.position.distanceTo(closestPoint);
-              
-              // Check if strictly in front of camera (t > 0) and within radius
-              if (t > 0 && distToBeam < BEAM_AOE_RADIUS) {
+              // 80 units is essentially the entire visible combat corridor
+              if (dist < 80) {
                   spawnExplosion(enemy.mesh.position);
                   spawnDamageText(enemy.mesh.position, 9999, true);
                   enemiesToRemove.push(idx);
               }
           });
 
-          // Remove enemies reverse order
           enemiesToRemove.sort((a, b) => b - a).forEach(idx => {
               const enemy = enemiesRef.current[idx];
               scene.remove(enemy.mesh);
@@ -679,8 +741,7 @@ const App: React.FC = () => {
               enemiesRef.current.splice(idx, 1);
           });
 
-          // Reset charges
-          return { ...prev, beamCharges: 0, score: prev.score + (enemiesToRemove.length * 50) };
+          return { ...prev, beamCharges: prev.beamCharges - 1, score: prev.score + (enemiesToRemove.length * 50) };
       });
     };
 
@@ -699,7 +760,6 @@ const App: React.FC = () => {
             setTimeout(() => { if (muzzleLightRef.current) muzzleLightRef.current.intensity = 0; }, 50);
         }
 
-        // Raycast from Cursor Position
         const raycaster = new THREE.Raycaster();
         const mouseVec = new THREE.Vector2(
             (cursorPositionRef.current.x * 2) - 1,
@@ -707,11 +767,9 @@ const App: React.FC = () => {
         );
         raycaster.setFromCamera(mouseVec, camera);
         
-        // Check intersections
         const enemyHitboxes = enemiesRef.current.map(e => e.hitbox);
         const intersects = raycaster.intersectObjects(enemyHitboxes);
 
-        // Default target far away
         let targetPoint = raycaster.ray.origin.clone().add(raycaster.ray.direction.multiplyScalar(100));
         let hitIndex = -1;
 
@@ -720,8 +778,6 @@ const App: React.FC = () => {
              hitIndex = enemiesRef.current.findIndex(e => e.hitbox === intersects[0].object);
         }
 
-        // Visual Beam
-        // Hand originates slightly offset, but swivels to target
         const startPoint = new THREE.Vector3(0.25, -0.3, -0.4).applyMatrix4(camera.matrixWorld);
         const distance = startPoint.distanceTo(targetPoint);
         
@@ -757,7 +813,7 @@ const App: React.FC = () => {
             setTimeout(() => setHitMarker(false), 100);
             
             const enemy = enemiesRef.current[hitIndex];
-            const dmg = 50; 
+            const dmg = 100; // ONE SHOT KILL UPDATE
             enemy.hp -= dmg;
             
             spawnDamageText(enemy.mesh.position, dmg);
@@ -778,13 +834,12 @@ const App: React.FC = () => {
         const enemy = enemiesRef.current[index];
         spawnExplosion(enemy.mesh.position);
         scene.remove(enemy.mesh);
-        scene.remove(enemy.hitbox); // Remove hitbox too
+        scene.remove(enemy.hitbox);
         enemiesRef.current.splice(index, 1);
         
         setGameState(prev => ({ 
             ...prev, 
-            score: prev.score + points,
-            beamCharges: Math.min(prev.beamCharges + 1, MAX_BEAM_CHARGES)
+            score: prev.score + points
         }));
     };
 
@@ -794,15 +849,24 @@ const App: React.FC = () => {
     const animate = () => {
       frameIdRef.current = requestAnimationFrame(animate);
       const time = performance.now();
-      const delta = Math.min((time - lastTime) / 1000, 0.1); // Cap delta
+      const delta = Math.min((time - lastTime) / 1000, 0.1);
       lastTime = time;
       const now = Date.now();
 
+      // INPUT SMOOTHING (LERP)
+      cursorPositionRef.current.x = THREE.MathUtils.lerp(cursorPositionRef.current.x, targetCursorPositionRef.current.x, 0.15);
+      cursorPositionRef.current.y = THREE.MathUtils.lerp(cursorPositionRef.current.y, targetCursorPositionRef.current.y, 0.15);
+
       if (gameState.status === 'playing') {
-          // AUTO-FORWARD MOVEMENT (Rail Shooter)
+          setHandInput(prev => ({
+              ...prev,
+              x: cursorPositionRef.current.x,
+              y: cursorPositionRef.current.y
+          }));
+
+          // AUTO-FORWARD MOVEMENT
           camera.position.z -= FLIGHT_SPEED * delta;
 
-          // Infinite Grid & Starfield
           if (gridHelperRef.current) {
             gridHelperRef.current.position.z = camera.position.z;
             gridHelperRef.current.position.x = camera.position.x;
@@ -811,15 +875,26 @@ const App: React.FC = () => {
              starsRef.current.position.z = camera.position.z;
           }
 
-          // STATIC CAMERA / PARALLAX AIMING
-          // We do NOT rotate continuously. We clamp rotation based on cursor position.
-          // Hand X 0.5 (Center) -> Rotation 0
-          // Hand X 1.0 (Right) -> Rotation -0.3 (Look slightly right)
-          const targetRotY = (0.5 - cursorPositionRef.current.x) * 0.6; // Max rotation angle
+          // PARALLAX AIMING
+          const targetRotY = (0.5 - cursorPositionRef.current.x) * 0.6; 
           const targetRotX = (0.5 - cursorPositionRef.current.y) * 0.4;
           
           camera.rotation.y = THREE.MathUtils.lerp(camera.rotation.y, targetRotY, delta * 5);
           camera.rotation.x = THREE.MathUtils.lerp(camera.rotation.x, targetRotX, delta * 5);
+
+          // UNIBEAM REGENERATION
+          if (gameState.beamCharges < MAX_BEAM_CHARGES) {
+              beamRegenTimerRef.current += delta * 1000;
+              if (beamRegenTimerRef.current >= BEAM_REGEN_MS) {
+                   setGameState(prev => ({
+                       ...prev,
+                       beamCharges: Math.min(prev.beamCharges + 1, MAX_BEAM_CHARGES)
+                   }));
+                   beamRegenTimerRef.current = 0;
+              }
+          } else {
+              beamRegenTimerRef.current = 0;
+          }
       }
 
       // Camera Shake
@@ -836,7 +911,7 @@ const App: React.FC = () => {
 
       // Update Beams
       activeLinesRef.current = activeLinesRef.current.filter(l => {
-          if (now - l.timestamp > 100) { // Check timestamp vs life
+          if (now - l.timestamp > 100) { 
               scene.remove(l.mesh);
               l.mesh.geometry.dispose();
               (l.mesh.material as THREE.Material).dispose();
@@ -852,6 +927,32 @@ const App: React.FC = () => {
           if (arc.life <= 0) {
               scene.remove(arc.mesh);
               electricalArcsRef.current.splice(i, 1);
+          }
+      }
+
+      // Update Shockwaves
+      for (let i = shockwavesRef.current.length - 1; i >= 0; i--) {
+          const sw = shockwavesRef.current[i];
+          sw.life += delta * 4.0; 
+          const scale = 1 + (sw.life * 30.0); 
+          
+          if (sw.direction) {
+             // Directional Ring
+             sw.mesh.scale.set(scale, scale, 1);
+             sw.mesh.position.add(sw.direction.clone().multiplyScalar(delta * 60));
+          } else {
+             // Omni Sphere (360)
+             sw.mesh.scale.set(scale, scale, scale);
+             // Omni shockwaves don't translate fast, they expand fast
+          }
+          
+          const opacity = Math.max(0, 0.9 - (sw.life * 0.4));
+          (sw.mesh.material as THREE.Material).opacity = opacity;
+          if (sw.light) sw.light.intensity = opacity * 4;
+
+          if (sw.life > 2.5) {
+              scene.remove(sw.mesh);
+              shockwavesRef.current.splice(i, 1);
           }
       }
 
@@ -882,14 +983,14 @@ const App: React.FC = () => {
 
       // MediaPipe Polling
       if (videoRef.current && gestureRecognizerRef.current && videoRef.current.readyState === 4) {
-          if (now - lastGestureTimeRef.current > 40) { // ~25fps
+          if (now - lastGestureTimeRef.current > 40) { 
             const results = gestureRecognizerRef.current.recognizeForVideo(videoRef.current, now);
             lastGestureTimeRef.current = now;
             
             let gesture = 'None';
             let detected = false;
-            let x = cursorPositionRef.current.x; // Default to existing
-            let y = cursorPositionRef.current.y;
+            let x = targetCursorPositionRef.current.x; 
+            let y = targetCursorPositionRef.current.y;
 
             if (results.landmarks && results.landmarks.length > 0) {
                 detected = true;
@@ -899,11 +1000,10 @@ const App: React.FC = () => {
                 y = pointer.y;
                 if (results.gestures.length > 0) gesture = results.gestures[0][0].categoryName;
                 
-                // Update Cursor Ref immediately for render loop
-                cursorPositionRef.current = { x, y };
+                targetCursorPositionRef.current = { x, y };
             }
 
-            setHandInput({ x, y, detected, gesture });
+            setHandInput(prev => ({ ...prev, detected, gesture })); 
 
             if (detected && gameState.status === 'playing') {
                 if (gesture === "Closed_Fist") fireRepulsor();
@@ -924,33 +1024,19 @@ const App: React.FC = () => {
          waveStartTimeRef.current = now;
       }
 
-      // Enemy Spawning
+      // Enemy Spawning - REDUCED RATE
       const targetEnemyCount = Math.min(15, 2 + (gameState.wave * 2));
-      if (enemiesRef.current.length < targetEnemyCount && Math.random() < 0.05) {
+      if (enemiesRef.current.length < targetEnemyCount && Math.random() < 0.015) {
           const spawnDistance = 60;
           const spawnZ = camera.position.z - spawnDistance;
-          // Spawn spread relative to camera X
           const spawnX = camera.position.x + (Math.random() - 0.5) * 30; 
           const spawnY = camera.position.y + (Math.random() * 8) - 2;
           
-          const geo = new THREE.SphereGeometry(0.3, 16, 16);
-          const ringGeo = new THREE.TorusGeometry(0.4, 0.02, 8, 16);
-          ringGeo.rotateX(Math.PI / 2);
-          
-          const mat = new THREE.MeshStandardMaterial({ 
-              color: 0x222222, 
-              emissive: 0xff0000, 
-              emissiveIntensity: 0.8,
-              roughness: 0.2,
-              metalness: 0.8
-          });
-          const mesh = new THREE.Mesh(geo, mat);
-          const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: 0xff3300 }));
+          const mesh = new THREE.Mesh(sharedGeometriesRef.current!.enemy, sharedMaterialsRef.current!.enemy);
+          const ring = new THREE.Mesh(sharedGeometriesRef.current!.enemyRing, sharedMaterialsRef.current!.enemyRing);
           mesh.add(ring);
 
-          const hitboxGeo = new THREE.SphereGeometry(0.8, 8, 8);
-          const hitboxMat = new THREE.MeshBasicMaterial({ visible: false });
-          const hitbox = new THREE.Mesh(hitboxGeo, hitboxMat);
+          const hitbox = new THREE.Mesh(sharedGeometriesRef.current!.hitbox, new THREE.MeshBasicMaterial({ visible: false }));
           
           mesh.position.set(spawnX, spawnY, spawnZ);
           hitbox.position.copy(mesh.position);
@@ -974,19 +1060,16 @@ const App: React.FC = () => {
       for (let i = enemiesRef.current.length - 1; i >= 0; i--) {
           const enemy = enemiesRef.current[i];
           
-          // AI: Steering
-          const approachSpeed = 8.0 + (gameState.wave * 0.5) + enemy.speedOffset;
+          const approachSpeed = 5.0 + (gameState.wave * 0.3) + enemy.speedOffset;
           const targetPos = camera.position.clone();
           targetPos.y = 1.0; 
           
           const desiredDir = targetPos.sub(enemy.mesh.position).normalize();
           const distToPlayer = enemy.mesh.position.distanceTo(camera.position);
           
-          // Fly-by logic
           const steerFactor = distToPlayer < 20 ? 0.5 * delta : 5.0 * delta;
           
           const currentDir = enemy.velocity.clone().normalize();
-          // Use a dummy check to prevent NaN on init
           if (currentDir.length() === 0) enemy.velocity.copy(desiredDir);
 
           const newDir = currentDir.lerp(desiredDir, steerFactor).normalize();
@@ -998,11 +1081,10 @@ const App: React.FC = () => {
           enemy.mesh.children[0].rotation.z += 5 * delta;
           enemy.mesh.lookAt(camera.position);
 
-          // Collision
           const pX = camera.position.x;
           const pZ = camera.position.z;
           const ePos = enemy.mesh.position;
-          const hitRadius = 0.4;
+          const hitRadius = 1.5; // Collision radius increased for bigger enemies
           const pWidth = 0.5; 
           const pHeight = 1.8;
           const pDepth = 0.5;
@@ -1014,7 +1096,7 @@ const App: React.FC = () => {
           if (collisionX && collisionZ && collisionY) {
               spawnExplosion(camera.position.clone().add(new THREE.Vector3(0,0,-1))); 
               addShake(1.0);
-              destroyEnemy(i, 0); // No points
+              destroyEnemy(i, 0); 
               
               setGameState(prev => {
                   const newHp = prev.health - 20;
@@ -1085,9 +1167,11 @@ const App: React.FC = () => {
         score: 0,
         wave: 1,
         enemies: [],
-        beamCharges: 0
+        beamCharges: 5 // Start fully charged
     });
     waveStartTimeRef.current = Date.now();
+    beamRegenTimerRef.current = 0; 
+    
     enemiesRef.current.forEach(e => {
         sceneRef.current?.remove(e.mesh);
         sceneRef.current?.remove(e.hitbox);
@@ -1095,7 +1179,7 @@ const App: React.FC = () => {
     enemiesRef.current = [];
     particlesRef.current.forEach(p => {
       sceneRef.current?.remove(p.mesh);
-      (p.mesh.material as THREE.Material).dispose();
+      // Do not dispose material/geo as they are shared now
     });
     particlesRef.current = [];
     damageTextsRef.current.forEach(t => sceneRef.current?.remove(t.sprite));
@@ -1134,7 +1218,7 @@ const App: React.FC = () => {
                 <span className="text-[10px] text-slate-300 font-mono">UNIBEAM</span>
                 <div className="flex items-center gap-2">
                     <span className="text-[9px] text-cyan-600 uppercase">Open Palm</span>
-                    <div className="w-2 h-2 bg-yellow-400 rounded-sm shadow-[0_0_5px_yellow]"></div>
+                    <div className="w-2 h-2 bg-blue-400 rounded-sm shadow-[0_0_5px_#3b82f6]"></div>
                 </div>
              </div>
              <div className="flex items-center justify-between">
